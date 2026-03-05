@@ -13,8 +13,9 @@ from player_data_select import player_data_select
 SELECTION_TYPE = 'NRL'
 
 # Define the years and corresponding rounds to fetch data for
-SELECT_YEARS = [2014, 2013, 2012, 2011, 2010, 2009, 2008, 2007, 2006, 2005, 2004, 2003, 2002, 2001]  # List of years to scrape data for
-SELECT_ROUNDS = [33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33]       # Corresponding rounds for each year
+# SELECT_YEARS = [2025, 2024, 2023, 2022, 2021, 2020, 2019, 2018, 2017, 2016, 2015, 2014, 2013, 2012]  # List of years to scrape data for
+SELECT_YEARS = [2026]  # List of years to scrape data for
+SELECT_ROUNDS = [1]       # Corresponding rounds for each year
 
 # Loop through each year and its respective round
 for year, rounds in zip(SELECT_YEARS, SELECT_ROUNDS):

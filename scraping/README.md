@@ -58,9 +58,10 @@ Open the HTML file in html_interfaces to use the interactive website viewer. It 
 
 
 ## Notes
-- Ensure `chromedriver` is properly configured.
+- Ensure `chromedriver` is properly configured for the Selenium-based scraper.
 - Modify `selected_year` and `selected_rounds` in script to adjust the range.
 - The script may require updates if the NRL website structure changes.
+- Team list data can also be fetched via plain HTTP requests (no Selenium needed) by reading the `q-data` JSON attribute from NRL match centre pages — this is how `predictions/predict_round.py` retrieves live squad lists.
 
 For any issues, refer to console logs for debugging.
 

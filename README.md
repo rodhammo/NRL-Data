@@ -1,40 +1,69 @@
 # NRL Machine Learning Models, Data Analytics and Data Scraper
 
 ⚠️ This library is still a Work-In-Progress. Feel free to help out by adding to the repository. ⚠️
+
 ## Description
-This project is a webscraper for NRL data, and provides a TensorFlow machine learning model for NRL related predictions. 
+This project is a web scraper for NRL data, and provides PyTorch machine learning models for NRL related predictions.
 
 ## How to Use
-Primarily use this code for Scraping at the moment. The prediction models are still a work in progress and all over the place. 
-**Go to [Scraping](./scraping/README.md) for information on how to download the data manually or on how to download the entire dataset easily.**
+
+### Installation
+```bash
+pip install -r requirements.txt
+```
+
+### Scraping Data
+See [Scraping](./scraping/README.md) for information on how to download the data or run the web scraper.
+
+### Running Predictions
+The easiest way to run predictions is with `predict_round.py`, which auto-detects the next unplayed round:
+
+```bash
+python predictions/predict_round.py
+```
+
+This trains a PyTorch neural network on historical data, fetches live team lists from the NRL website, and predicts winner/margin/first-try-scorer for each match.
+
+Jupyter notebooks in `/predictions/` are also available for exploratory analysis.
+
+## Project Structure
+
+```
+NRL-Data/
+├── scraping/          # Web scrapers and data downloader
+├── data/
+│   ├── loader.py      # Shared data loading and feature engineering
+│   ├── converter.py   # Convert JSON data to TXT/CSV formats
+│   └── {JSON files}   # Scraped data (gitignored)
+├── predictions/       # PyTorch ML models (predict_round.py + notebooks)
+├── visualisations/    # Interactive Plotly charts (Jupyter notebooks)
+├── converters/        # Legacy converter notebooks (deprecated, use data/converter.py)
+├── reports/           # Ad-hoc analytics using NRL data
+├── ENVIRONMENT_VARIABLES.py  # Teams, URLs, player labels, team colours
+└── requirements.txt   # Python dependencies
+```
 
 ## Data
 All data for this project is hosted on [this website](https://nrlpredictions.net/sport).
-I personally host this website with all data being stored in a S3 instance. 
+I personally host this website with all data being stored in a S3 instance.
 
 The following data is available:
-* NRL : 2001 - 2024 (you can run the scraper to get 2025 data)
+* NRL : 2001 - 2026
 * NRLW: 2022 - 2024
 * KNOCKON: 2022 - 2024
 * HOSTPLUS: 2022 - 2024
 
-
 ### 📂 Available Data Files
 
-| Data Type                                   | Description                                                                 |
-|---------------------------------------------|-----------------------------------------------------------------------------|
-| **📊 Detailed Match Data**           | In-depth statistics for each match, including team performance metrics and match events. |
-| **📊 General Match Data**    | Match data for every game from the selected years. |
-| **👤 Player Statistics**             | Individual player performance data, including tries, tackles, run meters, and more.  |
+| Data Type                        | Description                                                                              |
+|----------------------------------|------------------------------------------------------------------------------------------|
+| **📊 Detailed Match Data**       | In-depth statistics for each match, including team performance metrics and match events.  |
+| **📊 General Match Data**        | Match data for every game from the selected years.                                       |
+| **👤 Player Statistics**         | Individual player performance data, including tries, tackles, run meters, and more.      |
 
-## ⚠️ **Important Note**
-- **Player data requires match data** to be retrieved first.
-- Data is regularly updated and stored in a centralised location.
+> **Note:** Player data requires match data to be retrieved first.
 
-
-You can see player  data on the website, by waiting for the NRL Player Static Viewer to show (after selecting a year, type and Player Statics).
-
-### Player Statistics
+You can view player data on the website by selecting a year, type, and Player Statistics.
 
 ### Match Data
 <details>
@@ -60,37 +89,14 @@ You can see player  data on the website, by waiting for the NRL Player Static Vi
                   "items": {
                     "type": "object",
                     "properties": {
-                      "Details": {
-                        "type": "string"
-                      },
-                      "Date": {
-                        "type": "string"
-                      },
-                      "Home": {
-                        "type": "string"
-                      },
-                      "Home_Score": {
-                        "type": "string"
-                      },
-                      "Away": {
-                        "type": "string"
-                      },
-                      "Away_Score": {
-                        "type": "string"
-                      },
-                      "Venue": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "Details",
-                      "Date",
-                      "Home",
-                      "Home_Score",
-                      "Away",
-                      "Away_Score",
-                      "Venue"
-                    ]
+                      "Details": { "type": "string" },
+                      "Date": { "type": "string" },
+                      "Home": { "type": "string" },
+                      "Home_Score": { "type": "string" },
+                      "Away": { "type": "string" },
+                      "Away_Score": { "type": "string" },
+                      "Venue": { "type": "string" }
+                    }
                   }
                 }
               }
@@ -105,84 +111,39 @@ You can see player  data on the website, by waiting for the NRL Player Static Vi
 
 </details>
 
-
-
-### Detailed Match Data
-
-
-
-## Workspace
-This code is updated on Jupyter Notebooks (ipynb) and default python (py) files. 
-
-
-
-## Table of Contents
-- [NRL Machine Learning Models, Data Analytics and Data Scraper](#nrl-machine-learning-models-data-analytics-and-data-scraper)
-  - [Description](#description)
-  - [How to Use](#how-to-use)
-  - [Data](#data)
-    - [📂 Available Data Files](#-available-data-files)
-  - [⚠️ **Important Note**](#️-important-note)
-    - [Player Statistics](#player-statistics)
-    - [Match Data](#match-data)
-    - [Detailed Match Data](#detailed-match-data)
-  - [Workspace](#workspace)
-  - [Table of Contents](#table-of-contents)
-  - [Web Scraping](#web-scraping)
-  - [Machine Learning](#machine-learning)
-  - [Web Scraping](#web-scraping-1)
-  - [Visualisations](#visualisations)
-  - [Conveters](#conveters)
-  - [Installation](#installation)
-  - [Future Tasks](#future-tasks)
-  - [Help](#help)
-
-
 ## Web Scraping
-This project utilizes Selenium/Requests for web scraping NRL data from the NRL website. Currently, I manually perform this task weekly with limited plans for automation at present. This code is located in: 
-`/scraping/`
+This project utilises Selenium and Requests for web scraping NRL data from the NRL website. This code is located in `/scraping/`.
 
+## Machine Learning
+This code is located in `/predictions/`. Models use **PyTorch** for neural networks.
 
+The primary model is `predict_round.py` — a 2-layer neural network (128→64→2) that uses 49 features including rolling 5-game averages, head-to-head records, and stat differentials to predict match winners and margins. It uses early stopping, probability clamping (15–85%), and regularisation (dropout + weight decay) to produce realistic confidence levels. First try scorer predictions are filtered to players named in the weekly squad (fetched live from the NRL website).
 
+Legacy notebooks are also available:
+* **Match based** (`model_1.ipynb`): Earlier match prediction model.
+* **Player and Match based** (`model_1_players WIP.ipynb`): Player-based prediction (WIP).
+* **Anytime Try Scorer** (`antyime_try_scorer_model.ipynb`): Try scorer probability model (project root).
 
-## Machine Learning 
-This code is located in 
-`/predictions/`
-There are **two** different machine learning models:
-* Match based: Uses match statistics to form the final result. This project requires furthur optimisation. 
-* Player and Match based: Uses player statistics to form the final result. This project is currently WIP (however it provides code on how to manipulate the player data). 
+## Data Conversion
+JSON is the default format for all scraped data. To convert to TXT/CSV:
 
-## Web Scraping
-This project utilizes Selenium for web scraping NRL data from the NRL website. Currently, I manually perform this task weekly with limited plans for automation at present. This code is located in: 
-`/scraping/`
+```bash
+python data/converter.py --type all --years 2023
+```
+
+See [Data](./data/README.md) for more details.
 
 ## Visualisations
-Ways to Display the data are located in: 
-`/visualisations/`
+Interactive charts and data viewers are located in `/visualisations/`.
 
-
-## Conveters
-JSON is the default format for all code. Conversions tools have been generated to assist those who need .txt or .csv formats. These are located in: 
-`/converters/`
-
-## Installation
-* Download the required data from the above website and place it into the `/data/` folder.
-* Install the `requirements.txt` file 
-* Run the Jupyter notebook located in `/predictions/`
-
-## Future Tasks 
-* Update the machine learning model to work with 2024 data
+## Future Tasks
+* ~~Update the machine learning model to work with current data~~ ✅
+* ~~Anytime Try Scorer Probability model~~ ✅
+* ~~Integrate team lists into predictions~~ ✅
 * Update the website to display prediction results
-* Clean up all the code
-* Optimise the current machine learning model 
-* Update requirements.txt
-* Provide a more descriptive README
-* NRLW data
-* Anytime Try Scorer Probability model
+* Optimise the current machine learning model
+* NRLW prediction models
 * Try Location Data
-* ~~Team Stats - All Runs, All Run Metres, Post Contact Metres, Line Breaks, Tackle Breaks, Average Set Distance, Kick Return Metres, Average Play the Ball Speed, Offloads, Receipts, Total Passes, Dummy Passes, Kicks, Kicking Metres, Forced Drop Outs, Kick Defusal, Bombs, Grubbers, Effective Tackle, Tackles Made, Missed Tackles, Intercepts, Ineffective Tackles, Errors, Penalities Conceded, Ruck Infringements, On Reports, Interchanges Used~~
-* Replicate https://wicky.ai/content/analytics/predictive-analytics-applied-to-rugby-league-looking-at-try-scorers-in-the-nrl/ 
-* Provide a text export 
 
-## Help 
+## Help
 I intend for this project to be open source, so help is always handy!
