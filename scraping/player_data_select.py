@@ -101,7 +101,7 @@ def player_data_select(SELECT_YEAR, SELECT_ROUND, SELECTION_TYPE):
                 with open(player_stats_file, "w") as file:
                     json.dump(player_stats, file, indent=4)
 
-                print(f"✅ Round {round+1} data saved.")
+                print(f"Round {round+1} data saved.")
 
         except Exception as ex:
             print(f"Error: {ex}")

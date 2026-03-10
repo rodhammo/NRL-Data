@@ -98,7 +98,7 @@ def match_data_detailed_select(SELECT_YEAR, SELECT_ROUND, SELECTION_TYPE):
             # ** Save JSON after each round to avoid losing data **
             with open(OUTPUT_FILE_PATH, "w") as file:
                 json.dump({f"{SELECTION_TYPE}": match_json_datas}, file, indent=4)
-            print(f"✅ Round {round_num + 1} data saved.")
+            print(f"Round {round_num + 1} data saved.")
 
         except Exception as ex:
             print(f"Error processing round {round_num + 1}: {ex}")

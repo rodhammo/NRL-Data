@@ -1,34 +1,29 @@
 """
-Module to set up Chrome Web Driver for Scalping.
+Module to set up Chrome WebDriver for scraping.
 
-This module provides a function to set up the Chrome Web Driver with specific options
-for automated web scraping tasks related to Scalping.
+Uses webdriver-manager to automatically download and cache the correct
+ChromeDriver binary for the installed Chrome version.
 """
 
-import chromedriver_autoinstaller
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-
-chromedriver_autoinstaller.install()
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 
 def set_up_driver():
-    """Set up the Chrome Web Driver for Scalping.
+    """Set up a headless Chrome WebDriver for scraping.
 
-    This function sets up the Chrome Web Driver with specified options.
-    
     :return: WebDriver object for Chrome
     """
     options = Options()
-    # Ignore annoying messages from the NRL website 
     options.add_argument('--ignore-certificate-errors')
-    
-    # Run Selenium in headless mode
-    options.add_argument('--headless')
-    options.add_argument('log-level=3')
-    
-    # Exclude logging to assist with errors caused by NRL website 
+    options.add_argument('--headless=new')
+    options.add_argument('--log-level=3')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--no-sandbox')
     options.add_experimental_option('excludeSwitches', ['enable-logging'])
-    
-    driver = webdriver.Chrome(options=options)
+
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
     return driver

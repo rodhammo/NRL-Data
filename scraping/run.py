@@ -15,7 +15,7 @@ SELECTION_TYPE = 'NRL'
 # Define the years and corresponding rounds to fetch data for
 # SELECT_YEARS = [2025, 2024, 2023, 2022, 2021, 2020, 2019, 2018, 2017, 2016, 2015, 2014, 2013, 2012]  # List of years to scrape data for
 SELECT_YEARS = [2026]  # List of years to scrape data for
-SELECT_ROUNDS = [1]       # Corresponding rounds for each year
+SELECT_ROUNDS = [2]       # Corresponding rounds for each year
 
 # Loop through each year and its respective round
 for year, rounds in zip(SELECT_YEARS, SELECT_ROUNDS):

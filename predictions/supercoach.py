@@ -790,13 +790,20 @@ def main():
             f"({trades_remaining}/{TOTAL_SEASON_TRADES} remaining for season)"
         )
 
-        # Include current squad members in the pool even if they fail
-        # eligibility (they're already on our team), plus all eligible
-        current_pool_names = {p["name"] for p in eligible}
-        pool = list(eligible)
+        # Only allow trading IN players who are confirmed to play.
+        # Current squad members stay in the pool regardless of status
+        # (they're already on our team and can't be un-rostered).
+        trade_in_eligible = [
+            p for p in eligible
+            if p["name"] in current_names or p["status"] in PLAYING_ONLY_ALLOW
+        ]
+        pool = list(trade_in_eligible)
         for p in sc_players:
-            if p["name"] in current_names and p["name"] not in current_pool_names:
+            if p["name"] in current_names and p["name"] not in {x["name"] for x in pool}:
                 pool.append(p)
+
+        playing_in = sum(1 for p in pool if p["name"] not in current_names)
+        print(f"  {playing_in} confirmed-playing trade-in candidates")
 
         new_squad = optimize_squad(
             pool,
