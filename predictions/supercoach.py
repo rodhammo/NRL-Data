@@ -52,6 +52,263 @@ MULTI_BYE_ROUNDS = {12, 15, 18}  # 3 trades allowed instead of 2
 
 SQUAD_FILE = os.path.join(DATA_DIR, "my_supercoach_squad.json")
 
+SUPERCOACH_BASE = "https://www.supercoach.com.au/2026/api/nrl/classic/v1"
+
+
+# ── Squad Sync ─────────────────────────────────────────────────────────────────
+
+def sync_squad_from_web():
+    """Open SuperCoach using the user's existing Chrome profile so saved
+    logins work.  Requires Chrome to be closed first.
+
+    Captures the access_token from the Auth0 callback URL fragment and
+    then fetches the squad via the API.
+    """
+    import time
+    from urllib.parse import parse_qs
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+
+    # Use the user's real Chrome profile so saved passwords/sessions work
+    chrome_user_data = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data"
+    )
+
+    options = Options()
+    options.add_argument("--log-level=3")
+    options.add_argument("--disable-gpu")
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
+
+    if os.path.isdir(chrome_user_data):
+        options.add_argument(f"--user-data-dir={chrome_user_data}")
+        options.add_argument("--profile-directory=Default")
+        print("  Using your existing Chrome profile (close Chrome first!)")
+    else:
+        print("  Chrome profile not found, using fresh session")
+
+    service = Service(ChromeDriverManager().install())
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+    except Exception as e:
+        if "user data directory is already in use" in str(e).lower():
+            print("\n  ERROR: Chrome is still running. Please close ALL Chrome")
+            print("  windows and try again, or use --token instead:")
+            print("  python supercoach.py --sync-squad --token YOUR_TOKEN")
+            return False
+        raise
+
+    driver.get("https://www.supercoach.com.au/nrl/classic/team/field")
+    print("  Waiting for login (you have 5 minutes)...")
+
+    bearer_token = None
+    for _ in range(300):
+        time.sleep(1)
+        try:
+            url = driver.current_url
+        except Exception:
+            continue
+
+        # Token in Auth0 callback URL fragment
+        if "access_token=" in url:
+            fragment = url.split("#", 1)[-1] if "#" in url else ""
+            params = parse_qs(fragment)
+            if "access_token" in params:
+                bearer_token = f"Bearer {params['access_token'][0]}"
+                break
+
+        # Already logged in — try to extract token from localStorage
+        if "supercoach.com.au/nrl" in url and "login" not in url:
+            try:
+                token = driver.execute_script(
+                    "try {"
+                    "  for (var i = 0; i < localStorage.length; i++) {"
+                    "    var k = localStorage.key(i);"
+                    "    var v = localStorage.getItem(k);"
+                    "    if (v && v.length > 20 && v.length < 200"
+                    "        && k.toLowerCase().indexOf('token') >= 0) return v;"
+                    "  }"
+                    "  return null;"
+                    "} catch(e) { return null; }"
+                )
+                if token:
+                    bearer_token = f"Bearer {token}"
+                    break
+            except Exception:
+                pass
+
+    cookies_str = ""
+    if bearer_token:
+        try:
+            selenium_cookies = driver.get_cookies()
+            cookies_str = "; ".join(
+                f"{c['name']}={c['value']}" for c in selenium_cookies
+            )
+        except Exception:
+            pass
+
+    driver.quit()
+
+    if not bearer_token:
+        print("  Could not capture token. Use --token instead:")
+        print("    1. Open supercoach.com.au in your browser, log in")
+        print("    2. Press F12 > Network tab > click any API request")
+        print("    3. Copy the Authorization header value (after 'Bearer ')")
+        print("    4. Run: python supercoach.py --sync-squad --token YOUR_TOKEN")
+        return False
+
+    return _fetch_squad_with_token(bearer_token, cookies_str)
+
+
+def sync_squad_with_token(token):
+    """Sync squad using a manually-provided access token."""
+    if not token.startswith("Bearer "):
+        token = f"Bearer {token}"
+    return _fetch_squad_with_token(token)
+
+
+def _fetch_squad_with_token(bearer_token, cookies_str=""):
+
+    print(f"  Bearer token captured!  Fetching squad...")
+
+    headers = {
+        "Authorization": bearer_token,
+        "Cookie": cookies_str,
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Referer": "https://www.supercoach.com.au/",
+        "Origin": "https://www.supercoach.com.au",
+    }
+
+    # Step 1: Get user ID
+    me_resp = requests.get(f"{SUPERCOACH_BASE}/me", headers=headers, timeout=15)
+    me_resp.raise_for_status()
+    me = me_resp.json()
+    user_id = me.get("id") or (me.get("data") or {}).get("id")
+    user_teams = me.get("user_teams", [])
+    print(f"  Logged in as user {user_id}")
+
+    # Step 2: Get team ID and name
+    if user_teams:
+        team_id = user_teams[0]["id"]
+        team_name = user_teams[0].get("team_name", "My Team")
+    else:
+        ut_resp = requests.get(
+            f"{SUPERCOACH_BASE}/users/{user_id}/userteams?embed=user",
+            headers=headers, timeout=15,
+        )
+        ut_resp.raise_for_status()
+        ut_data = ut_resp.json()
+        if isinstance(ut_data, dict) and "teamname" in ut_data:
+            team_id = ut_data["id"]
+            team_name = ut_data.get("teamname", "My Team")
+        else:
+            ut_list = (
+                ut_data if isinstance(ut_data, list)
+                else ut_data.get("user_teams", [ut_data])
+            )
+            team_id = ut_list[0]["id"]
+            team_name = ut_list[0].get("teamname",
+                        ut_list[0].get("team_name", "My Team"))
+
+    print(f"  Team: {team_name} (id={team_id})")
+
+    # Step 3: Fetch roster (returns player_id + position, not full details)
+    roster_resp = requests.get(
+        f"{SUPERCOACH_BASE}/userteams/{team_id}/statsPlayers",
+        headers=headers, timeout=15,
+    )
+    roster_resp.raise_for_status()
+    roster_data = roster_resp.json()
+    roster_players = roster_data.get("players", [])
+    roster_trades = roster_data.get("trades", [])
+
+    if not roster_players:
+        print("  No players found in roster response!")
+        return False
+
+    print(f"  Found {len(roster_players)} players in roster")
+
+    # Step 4: Load full player details from cached API data to
+    # cross-reference player_id → name, team, price, positions
+    cache_path = os.path.join(DATA_DIR, "supercoach_players_2026.json")
+    if not os.path.exists(cache_path):
+        print("  Fetching full player list for cross-reference...")
+        pl_resp = requests.get(
+            SUPERCOACH_API,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=30,
+        )
+        pl_resp.raise_for_status()
+        all_players = pl_resp.json()
+        with open(cache_path, "w") as f:
+            json.dump(all_players, f, indent=2)
+    else:
+        with open(cache_path) as f:
+            all_players = json.load(f)
+
+    # Build lookup: player id → full details
+    player_lookup = {}
+    for p in all_players:
+        player_lookup[p["id"]] = p
+
+    # Build squad JSON in the same format save_squad() uses
+    squad = []
+    for rp in roster_players:
+        pid = rp["player_id"]
+        full = player_lookup.get(pid, {})
+        first = full.get("first_name", "")
+        last = full.get("last_name", "")
+        name = f"{first} {last}".strip()
+
+        positions = [pos["position"] for pos in full.get("positions", [])]
+        assigned = rp.get("position", positions[0] if positions else "CTW")
+        if not positions:
+            positions = [assigned]
+
+        stats = full.get("player_stats", [{}])
+        price = stats[0].get("price", 0) if stats else 0
+        is_starter = rp.get("picked", "true") == "true"
+
+        squad.append({
+            "name": name,
+            "team": (full.get("team") or {}).get("name", ""),
+            "positions": positions,
+            "assigned_position": assigned,
+            "price": price,
+            "starter": is_starter,
+        })
+
+    # Use API trade count; preserve local trade history
+    existing = _load_squad_file()
+    trade_history = existing.get("trade_history", []) if existing else []
+    # API reports total trades used in roster_data stats
+    api_stats = roster_data.get("stats", [{}])
+    trades_used = api_stats[0].get("total_changes", 0) if api_stats else 0
+
+    data = {
+        "squad": squad,
+        "trades_used": trades_used,
+        "trade_history": trade_history,
+    }
+    with open(SQUAD_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+    starters = [p for p in squad if p["starter"]]
+    bench = [p for p in squad if not p["starter"]]
+    total = sum(p["price"] for p in squad)
+    print(f"\n  Synced {len(squad)} players to {SQUAD_FILE}")
+    print(f"  Starters: {len(starters)}, Bench: {len(bench)}, "
+          f"Total salary: ${total:,d}, Trades used: {trades_used}/46")
+    print()
+    for p in squad:
+        role = "START" if p["starter"] else "bench"
+        print(f"    {p['name']:<28s} {p['team']:<15s} "
+              f"{p['assigned_position']:<5s} ${p['price']:>9,d}  {role}")
+
+    return True
+
 
 # ── Utility ────────────────────────────────────────────────────────────────────
 
@@ -208,6 +465,20 @@ def parse_supercoach_players(raw_players):
 
         played_status = p.get("played_status", {}).get("status", "pre")
 
+        # Extract next opponent info and position-specific opposition ranking
+        opp1 = stats.get("opp1") or {}
+        opp_name = opp1.get("name", "")
+        opp_rankings = {}
+        for r in opp1.get("opposition_ranking", []):
+            opp_rankings[r["position"]] = {
+                "avg": r.get("avg", 0),
+                "rank": r.get("rank", 8),  # 1=toughest, 17=easiest
+            }
+        is_home = bool(stats.get("opp1h", 0))
+
+        # Venue stats
+        ven1_avg = stats.get("ven1avg") or 0
+
         players.append({
             "name": f"{p['first_name']} {p['last_name']}",
             "team": team_name,
@@ -224,6 +495,10 @@ def parse_supercoach_players(raw_players):
             "played": played_status == "post",
             "ownership": stats.get("own") or 0,
             "breakeven": stats.get("be1") or 0,
+            "opponent": opp_name,
+            "opp_rankings": opp_rankings,
+            "is_home": is_home,
+            "venue_avg": ven1_avg,
         })
 
     return players
@@ -339,53 +614,94 @@ def load_historical_sc_points(years):
 
 # ── Point Prediction ───────────────────────────────────────────────────────────
 
-def predict_player_points(sc_player, historical, nrl_names):
+def compute_opponent_adjustments(sc_players):
+    """Compute league-average SC points conceded per position, used to
+    calculate per-player opponent difficulty multipliers.
+
+    Returns dict: position → league average points conceded.
+    """
+    pos_totals = defaultdict(list)
+    seen_teams = set()
+    for p in sc_players:
+        for pos, ranking in p.get("opp_rankings", {}).items():
+            team = p.get("opponent", "")
+            key = (team, pos)
+            if key not in seen_teams and ranking.get("avg", 0) > 0:
+                seen_teams.add(key)
+                pos_totals[pos].append(ranking["avg"])
+
+    return {pos: np.mean(vals) for pos, vals in pos_totals.items() if vals}
+
+
+def predict_player_points(sc_player, historical, nrl_names, league_opp_avgs=None):
     """Predict SuperCoach points per game for a player.
 
     Blends SuperCoach previous_average with estimated SC points from
-    historical NRL stats.
+    historical NRL stats, then adjusts for:
+    - Opponent difficulty (how many SC pts the opponent concedes at this position)
+    - Home/away advantage
     """
     prev_avg = sc_player["previous_average"]
     prev_games = sc_player["previous_games"]
     current_avg = sc_player["current_avg"]
     current_games = sc_player["current_games"]
 
-    # If the 2026 season is under way, weight current form
+    # Base prediction from form
     if current_games >= 3:
-        return current_avg * 0.6 + prev_avg * 0.4
-    if current_games > 0 and current_avg > 0:
-        return current_avg * 0.3 + prev_avg * 0.7
+        base = current_avg * 0.6 + prev_avg * 0.4
+    elif current_games > 0 and current_avg > 0:
+        base = current_avg * 0.3 + prev_avg * 0.7
+    else:
+        # Look up historical NRL stats for this player
+        matched = match_name(sc_player["name"], nrl_names)
+        hist_avg = 0.0
+        if matched and matched in historical:
+            games = historical[matched]
+            recent = [g["points"] for g in games if g["year"] >= 2025]
+            older = [g["points"] for g in games if g["year"] < 2025]
+            recent_avg = np.mean(recent) if recent else 0.0
+            older_avg = np.mean(older[-20:]) if older else 0.0
+            hist_avg = recent_avg * 0.7 + older_avg * 0.3 if recent else older_avg
 
-    # Look up historical NRL stats for this player
-    matched = match_name(sc_player["name"], nrl_names)
-    hist_avg = 0.0
-    if matched and matched in historical:
-        games = historical[matched]
-        recent = [g["points"] for g in games if g["year"] >= 2025]
-        older = [g["points"] for g in games if g["year"] < 2025]
-        recent_avg = np.mean(recent) if recent else 0.0
-        older_avg = np.mean(older[-20:]) if older else 0.0
-        hist_avg = recent_avg * 0.7 + older_avg * 0.3 if recent else older_avg
+        if prev_avg > 0 and prev_games >= 5:
+            base = prev_avg * 0.7 + hist_avg * 0.3 if hist_avg > 0 else prev_avg
+        elif hist_avg > 0:
+            base = hist_avg
+        else:
+            base = max(15.0, sc_player["price"] / 10_000)
 
-    if prev_avg > 0 and prev_games >= 5:
-        if hist_avg > 0:
-            return prev_avg * 0.7 + hist_avg * 0.3
-        return prev_avg
+    # ── Opponent difficulty adjustment ────────────────────────────────
+    # Compare what the opponent concedes at this position vs league avg.
+    # If opponent concedes 20% more than average → multiply by ~1.10
+    # If opponent concedes 20% less → multiply by ~0.90
+    # Capped to avoid wild swings on small sample sizes.
+    opp_factor = 1.0
+    if league_opp_avgs:
+        primary_pos = sc_player["positions"][0]
+        opp_ranking = sc_player.get("opp_rankings", {}).get(primary_pos, {})
+        opp_concedes = opp_ranking.get("avg", 0)
+        league_avg = league_opp_avgs.get(primary_pos, 0)
 
-    if hist_avg > 0:
-        return hist_avg
+        if opp_concedes > 0 and league_avg > 0:
+            raw_ratio = opp_concedes / league_avg
+            # Dampen the effect: apply 50% of the deviation
+            opp_factor = 1.0 + (raw_ratio - 1.0) * 0.5
+            opp_factor = max(0.80, min(1.20, opp_factor))
 
-    # Rookie / unknown – rough estimate from price
-    return max(15.0, sc_player["price"] / 10_000)
+    # ── Home/away adjustment ──────────────────────────────────────────
+    # Small boost for home games, slight penalty for away
+    home_factor = 1.02 if sc_player.get("is_home") else 0.98
+
+    return base * opp_factor * home_factor
 
 
 # ── Squad Optimization ─────────────────────────────────────────────────────────
 
-SCORING_17 = 17  # only best 17 from Starting 18 actually score
+STARTING_18 = 18  # 13 + 4 interchange + 1 flex on field; best 17 scores count
 
 
 def optimize_squad(players, strategy="points", current_squad_names=None,
-                   max_trades=None):
+                   max_trades=None, current_squad_positions=None):
     """Use MILP to find the optimal 26-man squad under the salary cap.
 
     Only the best 17 scores from your Starting 18 count each round, so
@@ -401,6 +717,10 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
         If provided, limits changes from the current squad to max_trades.
     max_trades : int | None
         Maximum number of players that can be swapped out of current_squad.
+    current_squad_positions : dict[str, int] | None
+        Position counts from the current squad (e.g. {"FLB": 2, "CTW": 7}).
+        When provided, the optimiser locks position-group counts so trades
+        are like-for-like (SuperCoach requires same-position swaps).
 
     Variables
     ---------
@@ -414,6 +734,7 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
     * Total squad = 26, exactly 17 starters.
     * Starter only if selected: s[i] <= sum_p x[i, p].
     * Total salary <= cap.
+    * (Trade mode) position counts locked to current squad's layout.
     """
     N = len(players)
     positions = list(POSITION_REQUIREMENTS.keys())
@@ -493,7 +814,7 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
         LinearConstraint(A_total, SQUAD_SIZE, SQUAD_SIZE),
         LinearConstraint(A_salary, 0, SALARY_CAP),
         LinearConstraint(A_starter, -np.inf, 0),       # s[i] <= selected[i]
-        LinearConstraint(A_scoring, SCORING_17, SCORING_17),
+        LinearConstraint(A_scoring, STARTING_18, STARTING_18),
     ]
 
     # 7. Trade constraint: keep at least (26 - max_trades) current squad members
@@ -509,6 +830,18 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
         min_keep = max(0, current_count - max_trades)
         constraints.append(LinearConstraint(A_keep, min_keep, current_count))
         trade_msg = f", max {max_trades} trades"
+
+    # 8. Position-lock constraint for trade mode: SuperCoach requires
+    #    like-for-like position trades, so the number of players assigned
+    #    to each position group must match the current squad's layout.
+    if current_squad_positions:
+        for j, pos in enumerate(positions):
+            count = current_squad_positions.get(pos, POSITION_REQUIREMENTS[pos])
+            A_pos_lock = np.zeros((1, num_vars))
+            for i in range(N):
+                A_pos_lock[0, i * P + j] = 1.0
+            constraints.append(LinearConstraint(A_pos_lock, count, count))
+        trade_msg += ", position-locked"
 
     print(f"  Optimising squad ({N} players, {num_vars} variables, best-17 scoring{trade_msg})...")
     result = milp(c=c, constraints=constraints, integrality=integrality, bounds=bounds)
@@ -696,7 +1029,23 @@ def main():
         "--confirm-trades", action="store_true",
         help="Actually save the recommended trades (without this, trades are preview only).",
     )
+    parser.add_argument(
+        "--sync-squad", action="store_true",
+        help="Sync your actual SuperCoach squad. Uses your Chrome profile "
+             "(close Chrome first) or combine with --token.",
+    )
+    parser.add_argument(
+        "--token", type=str, default=None,
+        help="Bearer token for --sync-squad (from browser DevTools).",
+    )
     args = parser.parse_args()
+
+    if args.sync_squad:
+        if args.token:
+            sync_squad_with_token(args.token)
+        else:
+            sync_squad_from_web()
+        return
 
     trade_mode = args.trades
     current_round = args.round or 1
@@ -742,9 +1091,15 @@ def main():
     print(f"  Computed SC points for {len(historical)} players from NRL stats")
 
     # ── 3. Predict points per player ──────────────────────────────────────
-    print("  Predicting player points...")
+    league_opp_avgs = compute_opponent_adjustments(sc_players)
+    if league_opp_avgs:
+        print(f"  Opponent adjustments: "
+              + ", ".join(f"{pos}={avg:.0f}" for pos, avg in sorted(league_opp_avgs.items())))
+    print("  Predicting player points (with opponent + home/away adjustments)...")
     for p in sc_players:
-        p["predicted_points"] = predict_player_points(p, historical, nrl_names)
+        p["predicted_points"] = predict_player_points(
+            p, historical, nrl_names, league_opp_avgs
+        )
         p["value"] = (
             p["predicted_points"] / (p["price"] / 100_000) if p["price"] > 0 else 0
         )
@@ -805,11 +1160,22 @@ def main():
         playing_in = sum(1 for p in pool if p["name"] not in current_names)
         print(f"  {playing_in} confirmed-playing trade-in candidates")
 
+        # Count current squad's position layout so trades are like-for-like.
+        # The "FLX" position from the API maps to whichever position the
+        # flex player is eligible for; assign it to their first position.
+        squad_pos_counts = defaultdict(int)
+        for p in my_squad:
+            pos = p.get("assigned_position", p["positions"][0])
+            if pos == "FLX":
+                pos = p["positions"][0] if p["positions"] else "2RF"
+            squad_pos_counts[pos] += 1
+
         new_squad = optimize_squad(
             pool,
             strategy=strategy,
             current_squad_names=current_names,
             max_trades=max_trades,
+            current_squad_positions=dict(squad_pos_counts),
         )
         if not new_squad:
             print("  Optimisation failed!")
@@ -822,7 +1188,6 @@ def main():
 
         if not traded_out:
             print("\n  NO TRADES RECOMMENDED - current squad is optimal.")
-            print_squad(new_squad)
         else:
             print(f"\n  RECOMMENDED TRADES ({len(traded_out)}):")
             out_players = [p for p in sc_players if p["name"] in traded_out]
@@ -843,9 +1208,38 @@ def main():
                 )
                 print()
 
-            print("  NEW SQUAD AFTER TRADES:")
-            print_squad(new_squad)
+        # Show recommended field vs bench lineup
+        field = sorted(
+            [p for p in new_squad if p["starter"]],
+            key=lambda p: p["predicted_points"], reverse=True,
+        )
+        bench = sorted(
+            [p for p in new_squad if not p["starter"]],
+            key=lambda p: p["predicted_points"], reverse=True,
+        )
+        field_pts = sum(p["predicted_points"] for p in field)
 
+        print(f"  RECOMMENDED LINEUP ({len(field)} on field, {len(bench)} on bench):")
+        print(f"  Field ({field_pts:.0f}pts):")
+        for p in field:
+            flag = " NEW" if p["name"] in traded_in else ""
+            print(
+                f"    {p['name']:<25s} {p['assigned_position']:<5s} "
+                f"{p['team']:<15s} {p['predicted_points']:>5.1f}pts{flag}"
+            )
+        print(f"  Bench:")
+        for p in bench:
+            flag = " NEW" if p["name"] in traded_in else ""
+            print(
+                f"    {p['name']:<25s} {p['assigned_position']:<5s} "
+                f"{p['team']:<15s} {p['predicted_points']:>5.1f}pts{flag}"
+            )
+        print()
+
+        print("  FULL SQUAD:")
+        print_squad(new_squad)
+
+        if traded_out:
             print(
                 f"\n  To confirm these trades, re-run with --confirm-trades."
                 f"\n  ({trades_remaining - len(traded_out)}/{TOTAL_SEASON_TRADES} "

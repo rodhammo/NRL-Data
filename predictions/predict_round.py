@@ -721,15 +721,15 @@ def main():
         # Show team lists if available
         squad = team_lists.get((home, away))
         if squad:
-            print(f"\n  TEAM LISTS:")
-            print(f"  {home}:")
+            # print(f"\n  TEAM LISTS:")
+            # print(f"  {home}:")
             for p in squad["home_players"]:
                 marker = "*" if p["isOnField"] else " "
-                print(f"    {marker} #{p['number']:2d} {p['fullName']:25s} {p['position']}")
+                # print(f"    {marker} #{p['number']:2d} {p['fullName']:25s} {p['position']}")
             print(f"  {away}:")
             for p in squad["away_players"]:
                 marker = "*" if p["isOnField"] else " "
-                print(f"    {marker} #{p['number']:2d} {p['fullName']:25s} {p['position']}")
+                # print(f"    {marker} #{p['number']:2d} {p['fullName']:25s} {p['position']}")
 
         features = build_feature_vector(home, away, team_detailed, matches)
 
