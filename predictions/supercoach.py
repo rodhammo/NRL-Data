@@ -48,6 +48,18 @@ POSITION_REQUIREMENTS = {
 
 SQUAD_SIZE = 26  # 25 positional + 1 flex
 TOTAL_SEASON_TRADES = 46
+
+# Minimum starters per position (the on-field 13).
+# Remaining 5 starter slots (interchange + flex) can be any position.
+MIN_STARTERS = {
+    "FLB": 1,
+    "CTW": 3,
+    "5/8": 1,
+    "HFB": 1,
+    "2RF": 2,
+    "FRF": 2,
+    "HOK": 1,
+}
 MULTI_BYE_ROUNDS = {12, 15, 18}  # 3 trades allowed instead of 2
 
 SQUAD_FILE = os.path.join(DATA_DIR, "my_supercoach_squad.json")
@@ -495,6 +507,7 @@ def parse_supercoach_players(raw_players):
             "played": played_status == "post",
             "ownership": stats.get("own") or 0,
             "breakeven": stats.get("be1") or 0,
+            "avg5": stats.get("avg5") or 0,
             "opponent": opp_name,
             "opp_rankings": opp_rankings,
             "is_home": is_home,
@@ -739,15 +752,25 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
     N = len(players)
     positions = list(POSITION_REQUIREMENTS.keys())
     P = len(positions)
-    # Variables: [x_0_0 .. x_0_P-1, x_1_0 .. x_N-1_P-1, s_0 .. s_N-1]
+    # Variables: [x[i,j] .. , s[i] .. , t[i,j] .. ]
+    #   x[i,j]  binary – player i assigned to position j (in the 26)
+    #   s[i]    binary – player i is a starter (in the 18)
+    #   t[i,j]  binary – player i is a starter AT position j (= x[i,j] * s[i])
     num_x = N * P
-    num_vars = num_x + N  # x variables + s (starter) variables
+    num_s = N
+    num_t = N * P
+    num_vars = num_x + num_s + num_t
 
     # ── Objective ─────────────────────────────────────────────────────────
     # Only starters contribute to the score (milp minimises → negate).
+    # BYE / non-playing squad members get 0 starter value so the optimizer
+    # always benches them in favour of someone who will actually score.
+    NON_PLAYING_STATUSES = ("Bye", "Injury", "Suspended", "NotPlayingNextRound")
     c = np.zeros(num_vars)
     for i, pl in enumerate(players):
-        if strategy == "growth":
+        if pl.get("status") in NON_PLAYING_STATUSES:
+            score = 0.0
+        elif strategy == "growth":
             score = (
                 pl["predicted_points"] * 0.4
                 + max(0, pl.get("growth", 0)) * 0.6
@@ -766,6 +789,11 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
     # s bounds: all players can potentially be starters
     for i in range(N):
         ub[num_x + i] = 1.0
+    # t bounds: same eligibility as x
+    for i, pl in enumerate(players):
+        for j, pos in enumerate(positions):
+            if pos in pl["positions"]:
+                ub[num_x + num_s + i * P + j] = 1.0
 
     bounds = Bounds(lb=0.0, ub=ub)
     integrality = np.ones(num_vars)
@@ -804,9 +832,37 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
         for j in range(P):
             A_starter[i, i * P + j] = -1.0    # -x[i,p]
 
-    # 6. Exactly 17 starters
+    # 6. Exactly 18 starters
     A_scoring = np.zeros((1, num_vars))
-    A_scoring[0, num_x:] = 1.0
+    A_scoring[0, num_x:num_x + num_s] = 1.0
+
+    # 7. Linearise t[i,j] = x[i,j] * s[i]:
+    #    t[i,j] <= x[i,j]
+    #    t[i,j] <= s[i]
+    #    t[i,j] >= x[i,j] + s[i] - 1
+    A_t_le_x = np.zeros((N * P, num_vars))
+    A_t_le_s = np.zeros((N * P, num_vars))
+    A_t_ge   = np.zeros((N * P, num_vars))
+    for i in range(N):
+        for j in range(P):
+            idx = i * P + j
+            t_idx = num_x + num_s + idx
+            A_t_le_x[idx, t_idx] = 1.0    # t[i,j] <= x[i,j]
+            A_t_le_x[idx, idx] = -1.0
+            A_t_le_s[idx, t_idx] = 1.0     # t[i,j] <= s[i]
+            A_t_le_s[idx, num_x + i] = -1.0
+            A_t_ge[idx, t_idx] = -1.0      # t[i,j] >= x[i,j] + s[i] - 1
+            A_t_ge[idx, idx] = 1.0         #  → x[i,j] + s[i] - t[i,j] <= 1
+            A_t_ge[idx, num_x + i] = 1.0
+
+    # 8. Minimum starters per position: sum_i t[i,j] >= MIN_STARTERS[j]
+    A_min_start = np.zeros((P, num_vars))
+    min_start_lb = np.zeros(P)
+    for j in range(P):
+        pos = positions[j]
+        for i in range(N):
+            A_min_start[j, num_x + num_s + i * P + j] = 1.0
+        min_start_lb[j] = MIN_STARTERS.get(pos, 0)
 
     constraints = [
         LinearConstraint(A_player, 0, 1),
@@ -815,6 +871,10 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
         LinearConstraint(A_salary, 0, SALARY_CAP),
         LinearConstraint(A_starter, -np.inf, 0),       # s[i] <= selected[i]
         LinearConstraint(A_scoring, STARTING_18, STARTING_18),
+        LinearConstraint(A_t_le_x, -np.inf, 0),        # t <= x
+        LinearConstraint(A_t_le_s, -np.inf, 0),        # t <= s
+        LinearConstraint(A_t_ge, -np.inf, 1),           # x + s - t <= 1
+        LinearConstraint(A_min_start, min_start_lb, np.inf),  # min starters/pos
     ]
 
     # 7. Trade constraint: keep at least (26 - max_trades) current squad members
@@ -1104,6 +1164,14 @@ def main():
             p["predicted_points"] / (p["price"] / 100_000) if p["price"] > 0 else 0
         )
         be = p["breakeven"]
+        if not be:
+            # API doesn't always provide breakeven. Estimate it:
+            # BE ≈ the score needed to maintain current price.
+            # SuperCoach prices move based on rolling 5-round avg vs price-
+            # implied average.  A reasonable proxy is the current average.
+            avg = p.get("avg5") or p.get("current_avg") or p.get("previous_average") or 0
+            be = avg
+            p["breakeven"] = be
         p["growth"] = p["predicted_points"] - be if be > 0 else 0
 
     # ── 4. Eligibility filter ─────────────────────────────────────────────
