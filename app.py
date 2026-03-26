@@ -26,6 +26,35 @@ SQUAD_FILE = os.path.join(DATA_DIR, "my_supercoach_squad.json")
 st.set_page_config(page_title="NRL SuperCoach Dashboard", page_icon="🏉", layout="wide")
 
 
+def detect_current_round():
+    """Detect the current (upcoming) round from the match data file.
+
+    Returns (year, round_num) where round_num is the first round where
+    ALL games have 0-0 scores (i.e. unplayed). Falls back to (2026, 1)
+    if no data file exists or all rounds have been played.
+    """
+    from datetime import datetime
+
+    year = datetime.now().year
+    data_file = os.path.join(DATA_DIR, "NRL", str(year), f"NRL_data_{year}.json")
+    if not os.path.exists(data_file):
+        return year, 1
+
+    try:
+        with open(data_file) as f:
+            data = json.load(f)
+        rounds = data["NRL"][0][str(year)]
+        for rd in rounds:
+            for round_num, games in rd.items():
+                if all(g["Home_Score"] == 0 and g["Away_Score"] == 0 for g in games):
+                    return year, int(round_num)
+        # All rounds have scores — return next round after the last one
+        last_round = max(int(k) for rd in rounds for k in rd)
+        return year, last_round + 1
+    except (KeyError, IndexError, json.JSONDecodeError):
+        return year, 1
+
+
 def run_command(cmd, cwd=None):
     """Run a command and stream output to a Streamlit container."""
     output_area = st.empty()
@@ -107,17 +136,19 @@ elif page == "Scrape NRL Data":
     st.title("📡 Scrape NRL Data")
     st.markdown("Update match results, detailed stats, and player statistics from NRL.com.")
 
+    detected_year, detected_round = detect_current_round()
+
     col1, col2 = st.columns(2)
     with col1:
-        scrape_year = st.number_input("Year", min_value=2012, max_value=2030, value=2026)
+        scrape_year = st.number_input("Year", min_value=2012, max_value=2030, value=detected_year)
     with col2:
-        scrape_round = st.number_input("Up to Round", min_value=1, max_value=30, value=2)
+        scrape_round = st.number_input("Round", min_value=1, max_value=30, value=detected_round)
+
+    st.caption("Scrapes a single round and merges with existing data.")
 
     if st.button("🚀 Start Scraping", type="primary"):
-        st.info(f"Scraping {scrape_year} Round 1–{scrape_round}...")
+        st.info(f"Scraping {scrape_year} Round {scrape_round}...")
 
-        # Build a small inline script that calls the scraping functions
-        # with the user-specified year/round, since run.py has them hardcoded.
         script = f"""
 import sys, os
 sys.path.insert(0, r"{SCRAPING_DIR}")
@@ -126,13 +157,13 @@ from match_data_select import match_data_select
 from match_data_detailed_select import match_data_detailed_select
 from player_data_select import player_data_select
 year = {scrape_year}
-rounds = {scrape_round}
+round_num = {scrape_round}
 directory_path = r"{os.path.join(DATA_DIR, 'NRL', str(scrape_year))}"
 os.makedirs(directory_path, exist_ok=True)
-print(f"Scraping Year: {{year}}, Round: {{rounds}}")
-match_data_select(year, rounds, 'NRL')
-match_data_detailed_select(year, rounds, 'NRL')
-player_data_select(year, rounds, 'NRL')
+print(f"Scraping Year: {{year}}, Round: {{round_num}}")
+match_data_select(year, round_num, 'NRL')
+match_data_detailed_select(year, round_num, 'NRL')
+player_data_select(year, round_num, 'NRL')
 print("Data scraping process completed successfully.")
 """
         run_command([sys.executable, "-c", script], cwd=SCRAPING_DIR)
@@ -160,9 +191,11 @@ elif page == "SuperCoach Trades":
     if not squad_data:
         st.warning("No squad found. Sync your squad first, or run without trades to build an initial squad.")
 
+    _, detected_sc_round = detect_current_round()
+
     col1, col2 = st.columns(2)
     with col1:
-        sc_round = st.number_input("Round", min_value=1, max_value=30, value=2)
+        sc_round = st.number_input("Round", min_value=1, max_value=30, value=detected_sc_round)
     with col2:
         strategy = st.selectbox("Strategy", ["points", "growth"])
 

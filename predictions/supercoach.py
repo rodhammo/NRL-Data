@@ -714,7 +714,8 @@ STARTING_18 = 18  # 13 + 4 interchange + 1 flex on field; best 17 scores count
 
 
 def optimize_squad(players, strategy="points", current_squad_names=None,
-                   max_trades=None, current_squad_positions=None):
+                   max_trades=None, current_squad_positions=None,
+                   salary_cap_override=None):
     """Use MILP to find the optimal 26-man squad under the salary cap.
 
     Only the best 17 scores from your Starting 18 count each round, so
@@ -771,9 +772,10 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
         if pl.get("status") in NON_PLAYING_STATUSES:
             score = 0.0
         elif strategy == "growth":
+            growth = pl.get("growth", 0)
             score = (
-                pl["predicted_points"] * 0.4
-                + max(0, pl.get("growth", 0)) * 0.6
+                pl["predicted_points"] * 0.7
+                + max(0, growth) * 0.3
             )
         else:
             score = pl["predicted_points"]
@@ -819,6 +821,7 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
     A_total[0, :num_x] = 1.0
 
     # 4. Salary cap (applies to all 26 selected players)
+    effective_cap = salary_cap_override if salary_cap_override is not None else SALARY_CAP
     A_salary = np.zeros((1, num_vars))
     for i, pl in enumerate(players):
         for j in range(P):
@@ -868,7 +871,7 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
         LinearConstraint(A_player, 0, 1),
         LinearConstraint(A_pos, pos_lb, pos_ub),
         LinearConstraint(A_total, SQUAD_SIZE, SQUAD_SIZE),
-        LinearConstraint(A_salary, 0, SALARY_CAP),
+        LinearConstraint(A_salary, 0, effective_cap),
         LinearConstraint(A_starter, -np.inf, 0),       # s[i] <= selected[i]
         LinearConstraint(A_scoring, STARTING_18, STARTING_18),
         LinearConstraint(A_t_le_x, -np.inf, 0),        # t <= x
@@ -995,8 +998,9 @@ def _status_flag(player):
     return STATUS_FLAGS.get(player.get("status", ""), "")
 
 
-def print_squad(squad):
+def print_squad(squad, salary_cap=None):
     """Print the optimised squad in a formatted table."""
+    salary_cap = salary_cap or SALARY_CAP
     starters = [p for p in squad if p.get("starter", True)]
     bench = [p for p in squad if not p.get("starter", True)]
     total_price = sum(p["price"] for p in squad)
@@ -1046,7 +1050,7 @@ def print_squad(squad):
         f"  {'TOTAL (26)':<25s} {'':15s} {'':8s} "
         f"${total_price:>9,d}"
     )
-    print(f"  Salary cap remaining: ${SALARY_CAP - total_price:,d}")
+    print(f"  Salary cap remaining: ${salary_cap - total_price:,d}")
     print(f"  Bench spend: ${bench_price:,d} on {len(bench)} players")
 
     if warnings:
@@ -1176,15 +1180,36 @@ def main():
 
     # ── 4. Eligibility filter ─────────────────────────────────────────────
     ALWAYS_EXCLUDE = ("Suspended", "Injury")
-    PLAYING_ONLY_ALLOW = ("PlayingNextRound",)
     playing_only = getattr(args, "playing_only", False) or strategy == "growth"
+
+    # Fetch NRL team lists to identify confirmed-playing players
+    confirmed_names = set()
+    if playing_only:
+        print("  Fetching NRL team lists to confirm playing squads...")
+        try:
+            from predict_round import get_upcoming_matches, fetch_team_lists
+            pred_year, pred_round, upcoming = get_upcoming_matches()
+            if upcoming:
+                team_lists = fetch_team_lists(pred_year, pred_round, upcoming)
+                for (home, away), squad in team_lists.items():
+                    for p in squad.get("home_players", []):
+                        confirmed_names.add(p["fullName"].strip().lower())
+                    for p in squad.get("away_players", []):
+                        confirmed_names.add(p["fullName"].strip().lower())
+                print(f"  {len(confirmed_names)} players confirmed in NRL team lists")
+            else:
+                print("  No upcoming matches found, skipping playing-only filter")
+                playing_only = False
+        except Exception as e:
+            print(f"  Could not fetch team lists ({e}), skipping playing-only filter")
+            playing_only = False
 
     def is_eligible(p):
         if p["locked"]:
             return False
         if p["status"] in ALWAYS_EXCLUDE:
             return False
-        if playing_only and p["status"] not in PLAYING_ONLY_ALLOW:
+        if playing_only and p["name"].strip().lower() not in confirmed_names:
             return False
         return True
 
@@ -1213,12 +1238,24 @@ def main():
             f"({trades_remaining}/{TOTAL_SEASON_TRADES} remaining for season)"
         )
 
+        # Compute effective salary cap for trade mode.
+        # Players already owned keep their value regardless of price rises,
+        # so the cap = current squad total at API prices + remaining budget.
+        saved_total = sum(p["price"] for p in my_squad)
+        remaining_budget = SALARY_CAP - saved_total
+        sc_lookup = {p["name"]: p["price"] for p in sc_players}
+        current_api_total = sum(sc_lookup.get(p["name"], p["price"]) for p in my_squad)
+        trade_cap = current_api_total + remaining_budget
+        print(f"  Salary budget: ${remaining_budget:,} available for trade upgrades")
+
         # Only allow trading IN players who are confirmed to play.
         # Current squad members stay in the pool regardless of status
         # (they're already on our team and can't be un-rostered).
         trade_in_eligible = [
             p for p in eligible
-            if p["name"] in current_names or p["status"] in PLAYING_ONLY_ALLOW
+            if p["name"] in current_names
+            or (confirmed_names and p["name"].strip().lower() in confirmed_names)
+            or not confirmed_names
         ]
         pool = list(trade_in_eligible)
         for p in sc_players:
@@ -1244,6 +1281,7 @@ def main():
             current_squad_names=current_names,
             max_trades=max_trades,
             current_squad_positions=dict(squad_pos_counts),
+            salary_cap_override=trade_cap,
         )
         if not new_squad:
             print("  Optimisation failed!")
@@ -1305,7 +1343,7 @@ def main():
         print()
 
         print("  FULL SQUAD:")
-        print_squad(new_squad)
+        print_squad(new_squad, salary_cap=trade_cap)
 
         if traded_out:
             print(

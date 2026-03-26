@@ -8,14 +8,9 @@ import sys
 sys.path.append("..")
 import ENVIRONMENT_VARIABLES as EV
 
-# Define key variables
-# SELECTION_TYPE = 'HOSTPLUS'
-# SELECT_YEAR = 2024
-# SELECT_ROUND = 1
 
-def match_data_detailed_select(SELECT_YEAR, SELECT_ROUND, SELECTION_TYPE):
-    
-        
+def match_data_detailed_select(SELECT_YEAR, round_num, SELECTION_TYPE):
+
     VARIABLES = ["Year", "Win", "Defense", "Attack", "Margin", "Home", "Versus", "Round"]
     JSON_FILE_PATH = f"../data/{SELECTION_TYPE}/{SELECT_YEAR}/{SELECTION_TYPE}_data_{SELECT_YEAR}.json"
     OUTPUT_FILE_PATH = f"../data/{SELECTION_TYPE}/{SELECT_YEAR}/{SELECTION_TYPE}_detailed_match_data_{SELECT_YEAR}.json"
@@ -49,9 +44,21 @@ def match_data_detailed_select(SELECT_YEAR, SELECT_ROUND, SELECTION_TYPE):
 
     # Extract data for the selected year
     try:
-        years_arr = {SELECT_YEAR: data[0][str(SELECT_YEAR)]}  # Use direct indexing
+        years_arr = {SELECT_YEAR: data[0][str(SELECT_YEAR)]}
     except IndexError as e:
         print(f"Error accessing year data: {e}")
+        sys.exit(1)
+
+    # Find the round data by key from match data
+    round_key = str(round_num)
+    round_data_from_match = None
+    for rd in years_arr[SELECT_YEAR]:
+        if round_key in rd:
+            round_data_from_match = rd[round_key]
+            break
+
+    if round_data_from_match is None:
+        print(f"Round {round_num} not found in match data.")
         sys.exit(1)
 
     # Create DataFrame with appropriate columns
@@ -59,7 +66,7 @@ def match_data_detailed_select(SELECT_YEAR, SELECT_ROUND, SELECTION_TYPE):
 
 
     # ** Function to Fetch Data for a Single Match (Using Persistent WebDriver) **
-    def fetch_match_data(driver, game, round_num):
+    def fetch_match_data(driver, game, rnd):
         h_team, a_team = game["Home"], game["Away"]
 
         # Try fetching data twice before failing
@@ -67,9 +74,9 @@ def match_data_detailed_select(SELECT_YEAR, SELECT_ROUND, SELECTION_TYPE):
         for attempt in range(2):
             try:
                 game_data = get_detailed_nrl_data(
-                    round=round_num + 1, year=SELECT_YEAR,
+                    round=rnd, year=SELECT_YEAR,
                     home_team=h_team.lower(), away_team=a_team.lower(),
-                    driver=driver, nrl_website=WEBSITE  # **Pass persistent WebDriver**
+                    driver=driver, nrl_website=WEBSITE
                 )
                 if "match" in game_data:
                     return {f"{h_team} v {a_team}": game_data}  
@@ -79,30 +86,55 @@ def match_data_detailed_select(SELECT_YEAR, SELECT_ROUND, SELECTION_TYPE):
         return None 
 
 
-    # ** Keep Selenium WebDriver Open **
-    driver = set_up_driver()  # **Initialize WebDriver once**
-    match_json_datas = []
-
-    for round_num in range(SELECT_ROUND):
+    # Load existing output data if it exists
+    existing_data = None
+    import os
+    if os.path.exists(OUTPUT_FILE_PATH):
         try:
-            round_data = years_arr[SELECT_YEAR][round_num][str(round_num + 1)]
-            round_data_scores = []
+            with open(OUTPUT_FILE_PATH, "r") as file:
+                existing_data = json.load(file)
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"Error loading existing detailed data, starting fresh: {e}")
 
-            for game in round_data:
-                match_data = fetch_match_data(driver, game, round_num)
-                if match_data:
-                    round_data_scores.append(match_data)
+    # ** Keep Selenium WebDriver Open **
+    driver = set_up_driver()
 
-            match_json_datas.append({round_num + 1: round_data_scores})
+    print(f"Fetching detailed match data for {SELECTION_TYPE} {SELECT_YEAR}, Round {round_num}...")
 
-            # ** Save JSON after each round to avoid losing data **
-            with open(OUTPUT_FILE_PATH, "w") as file:
-                json.dump({f"{SELECTION_TYPE}": match_json_datas}, file, indent=4)
-            print(f"Round {round_num + 1} data saved.")
+    try:
+        round_data_scores = []
 
-        except Exception as ex:
-            print(f"Error processing round {round_num + 1}: {ex}")
+        for game in round_data_from_match:
+            match_data = fetch_match_data(driver, game, round_num)
+            if match_data:
+                round_data_scores.append(match_data)
 
-    # ** Close WebDriver after all rounds are processed **
+        new_round_entry = {round_num: round_data_scores}
+
+        # Merge into existing data
+        if existing_data and SELECTION_TYPE in existing_data:
+            match_json_datas = existing_data[SELECTION_TYPE]
+            # Check if round already exists, replace if so
+            replaced = False
+            for i, rd in enumerate(match_json_datas):
+                if round_num in rd:
+                    match_json_datas[i] = new_round_entry
+                    replaced = True
+                    break
+            if not replaced:
+                match_json_datas.append(new_round_entry)
+            # Sort rounds by numeric key
+            match_json_datas.sort(key=lambda rd: int(list(rd.keys())[0]))
+        else:
+            existing_data = {SELECTION_TYPE: [new_round_entry]}
+
+        with open(OUTPUT_FILE_PATH, "w") as file:
+            json.dump(existing_data, file, indent=4)
+        print(f"Round {round_num} data saved.")
+
+    except Exception as ex:
+        print(f"Error processing round {round_num}: {ex}")
+
+    # ** Close WebDriver after processing **
     driver.quit()
-    print(f"Final player statistics saved to {OUTPUT_FILE_PATH}")
+    print(f"Final detailed match data saved to {OUTPUT_FILE_PATH}")
