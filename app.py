@@ -147,7 +147,15 @@ elif page == "Scrape NRL Data":
     st.caption("Scrapes a single round and merges with existing data.")
 
     if st.button("🚀 Start Scraping", type="primary"):
-        st.info(f"Scraping {scrape_year} Round {scrape_round}...")
+        rounds_to_scrape = [scrape_round]
+        if scrape_round > 1:
+            rounds_to_scrape.insert(0, scrape_round - 1)
+            st.info(
+                f"Scraping {scrape_year} Round {scrape_round - 1} (previous stats) "
+                f"and Round {scrape_round} (upcoming fixtures)..."
+            )
+        else:
+            st.info(f"Scraping {scrape_year} Round {scrape_round}...")
 
         script = f"""
 import sys, os
@@ -157,13 +165,15 @@ from match_data_select import match_data_select
 from match_data_detailed_select import match_data_detailed_select
 from player_data_select import player_data_select
 year = {scrape_year}
-round_num = {scrape_round}
+rounds = {rounds_to_scrape}
 directory_path = r"{os.path.join(DATA_DIR, 'NRL', str(scrape_year))}"
 os.makedirs(directory_path, exist_ok=True)
-print(f"Scraping Year: {{year}}, Round: {{round_num}}")
-match_data_select(year, round_num, 'NRL')
-match_data_detailed_select(year, round_num, 'NRL')
-player_data_select(year, round_num, 'NRL')
+for round_num in rounds:
+    print(f"Scraping Year: {{year}}, Round: {{round_num}}")
+    match_data_select(year, round_num, 'NRL')
+    match_data_detailed_select(year, round_num, 'NRL')
+    player_data_select(year, round_num, 'NRL')
+    print(f"Round {{round_num}} complete.")
 print("Data scraping process completed successfully.")
 """
         run_command([sys.executable, "-c", script], cwd=SCRAPING_DIR)
@@ -257,6 +267,27 @@ elif page == "Sync Squad":
     # Show current squad
     squad_data = load_squad()
     if squad_data:
+        st.divider()
+        st.subheader("Salary Budget")
+        st.markdown(
+            "If the API doesn't return your remaining salary during sync, "
+            "set it manually here (check supercoach.com.au for the value)."
+        )
+        current_budget = squad_data.get("salary_remaining")
+        budget_input = st.number_input(
+            "Remaining salary ($)",
+            min_value=0,
+            max_value=5_000_000,
+            value=current_budget if current_budget is not None else 0,
+            step=10_000,
+            format="%d",
+        )
+        if st.button("💾 Save Budget"):
+            squad_data["salary_remaining"] = budget_input
+            with open(SQUAD_FILE, "w") as f:
+                json.dump(squad_data, f, indent=2)
+            st.success(f"Saved remaining salary: ${budget_input:,}")
+
         st.divider()
         st.subheader("Current Squad")
         squad = squad_data.get("squad", [])

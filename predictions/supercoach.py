@@ -14,6 +14,7 @@ Usage:
 import sys
 import os
 import json
+import re
 import argparse
 from collections import defaultdict
 
@@ -61,6 +62,7 @@ MIN_STARTERS = {
     "HOK": 1,
 }
 MULTI_BYE_ROUNDS = {12, 15, 18}  # 3 trades allowed instead of 2
+NON_PLAYING_STATUSES = ("Bye", "Injury", "Suspended", "NotPlayingNextRound")
 
 SQUAD_FILE = os.path.join(DATA_DIR, "my_supercoach_squad.json")
 
@@ -299,11 +301,39 @@ def _fetch_squad_with_token(bearer_token, cookies_str=""):
     api_stats = roster_data.get("stats", [{}])
     trades_used = api_stats[0].get("total_changes", 0) if api_stats else 0
 
+    # Capture salary remaining from the API.
+    # The API may report it as salary_remaining or remaining_salary in stats.
+    salary_remaining = None
+    if api_stats:
+        salary_remaining = (
+            api_stats[0].get("salary_remaining")
+            or api_stats[0].get("remaining_salary")
+            or api_stats[0].get("salary_cap_remaining")
+            or api_stats[0].get("cap_remaining")
+        )
+    # Also check top-level roster data
+    if salary_remaining is None:
+        salary_remaining = (
+            roster_data.get("salary_remaining")
+            or roster_data.get("remaining_salary")
+            or roster_data.get("salary_cap_remaining")
+            or roster_data.get("cap_remaining")
+        )
+    if salary_remaining is None:
+        # Debug: dump available keys so we can find the right field
+        stat_keys = list(api_stats[0].keys()) if api_stats else []
+        roster_keys = [k for k in roster_data.keys() if k != "players"]
+        print(f"  [debug] salary_remaining not found in API response")
+        print(f"  [debug] stat keys: {stat_keys}")
+        print(f"  [debug] roster keys: {roster_keys}")
+
     data = {
         "squad": squad,
         "trades_used": trades_used,
         "trade_history": trade_history,
     }
+    if salary_remaining is not None:
+        data["salary_remaining"] = int(salary_remaining)
     with open(SQUAD_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -350,23 +380,47 @@ def parse_mins(val):
     return parse_num(val)
 
 
+def normalize_name(name):
+    """Normalize names for matching by stripping punctuation and casing."""
+    if not name:
+        return ""
+    normalized = re.sub(r"[^\w\s]", " ", str(name)).strip().lower()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
 def match_name(sc_name, nrl_names):
     """Match a SuperCoach player name to NRL stats player names.
 
-    Uses exact match first, then first-initial + full last name match.
+    Uses exact normalized match first, then handles initials and alternate
+    name ordering. This is deliberately conservative to avoid false hits.
     """
-    sc_lower = sc_name.strip().lower()
+    sc_norm = normalize_name(sc_name)
+    sc_parts = sc_norm.split()
+
     for nrl_name in nrl_names:
-        nrl_lower = nrl_name.lower()
-        if sc_lower == nrl_lower:
+        nrl_norm = normalize_name(nrl_name)
+        if sc_norm == nrl_norm:
             return nrl_name
-        sc_parts = sc_lower.split()
-        nrl_parts = nrl_lower.split()
+
+    for nrl_name in nrl_names:
+        nrl_norm = normalize_name(nrl_name)
+        nrl_parts = nrl_norm.split()
         if len(sc_parts) >= 2 and len(nrl_parts) >= 2:
             sc_last = " ".join(sc_parts[1:])
             nrl_last = " ".join(nrl_parts[1:])
             if sc_last == nrl_last and sc_parts[0][0] == nrl_parts[0][0]:
                 return nrl_name
+
+    # Try reversed order if the NRL name is stored as "Last, First".
+    for nrl_name in nrl_names:
+        if "," in nrl_name:
+            parts = [p.strip() for p in nrl_name.split(",") if p.strip()]
+            if len(parts) == 2:
+                reversed_name = normalize_name(f"{parts[1]} {parts[0]}")
+                if sc_norm == reversed_name:
+                    return nrl_name
+
     return None
 
 
@@ -415,8 +469,13 @@ def load_my_squad():
     """Load saved squad and trade tracking info."""
     data = _load_squad_file()
     if not data:
-        return None, 0, []
-    return data["squad"], data.get("trades_used", 0), data.get("trade_history", [])
+        return None, 0, [], None
+    return (
+        data["squad"],
+        data.get("trades_used", 0),
+        data.get("trade_history", []),
+        data.get("salary_remaining"),
+    )
 
 
 def record_trades(trade_list, current_round):
@@ -434,6 +493,68 @@ def record_trades(trade_list, current_round):
         data["trades_used"] += 1
     with open(SQUAD_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+
+# ── Breakeven Scraping ─────────────────────────────────────────────────────────
+
+BE_CACHE_FILE = os.path.join(DATA_DIR, "supercoach_breakevens.json")
+
+
+def fetch_breakevens():
+    """Scrape breakeven numbers from nrlsupercoachstats.com.
+
+    Returns dict mapping "First Last" player names to their BE number.
+    Caches to disk so it can be reused offline.
+    """
+    url = "https://nrlsupercoachstats.com/TeamBEs.php"
+    try:
+        print("  Fetching breakeven data from nrlsupercoachstats.com...")
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  Could not fetch BEs ({e}), using cache")
+        return _load_be_cache()
+
+    # The page has malformed nested <td> tags so we parse with regex.
+    # Pattern: <a href="./index.php?player=...">Last, First</a><td><td ...>BE</td>
+    pattern = re.compile(
+        r'<a[^>]*href="[^"]*index\.php\?player=[^"]*"[^>]*>\s*'
+        r'([^<]+?)\s*</a>\s*'
+        r'<td>\s*<td[^>]*>\s*'
+        r'(-?\d+)\s*</td>',
+        re.DOTALL,
+    )
+
+    players = {}
+    for m in pattern.finditer(resp.text):
+        name_text = m.group(1).strip()
+        be = int(m.group(2))
+        parts = name_text.split(", ", 1)
+        if len(parts) == 2:
+            name = f"{parts[1]} {parts[0]}"
+        else:
+            name = name_text
+        players[name] = be
+
+    if players:
+        with open(BE_CACHE_FILE, "w") as f:
+            json.dump(players, f, indent=2)
+        print(f"  Scraped {len(players)} player breakevens")
+    else:
+        print("  No BEs parsed, using cache")
+        return _load_be_cache()
+
+    return players
+
+
+def _load_be_cache():
+    """Load cached breakeven data from disk."""
+    if os.path.exists(BE_CACHE_FILE):
+        with open(BE_CACHE_FILE) as f:
+            data = json.load(f)
+        print(f"  Loaded {len(data)} cached breakevens")
+        return data
+    return {}
 
 
 # ── Data Fetching ──────────────────────────────────────────────────────────────
@@ -658,12 +779,15 @@ def predict_player_points(sc_player, historical, nrl_names, league_opp_avgs=None
     prev_games = sc_player["previous_games"]
     current_avg = sc_player["current_avg"]
     current_games = sc_player["current_games"]
+    avg5 = sc_player.get("avg5") or 0.0
 
     # Base prediction from form
-    if current_games >= 3:
-        base = current_avg * 0.6 + prev_avg * 0.4
+    if current_games >= 5:
+        base = current_avg * 0.6 + prev_avg * 0.25 + avg5 * 0.15
+    elif current_games >= 3:
+        base = current_avg * 0.55 + prev_avg * 0.25 + avg5 * 0.20
     elif current_games > 0 and current_avg > 0:
-        base = current_avg * 0.3 + prev_avg * 0.7
+        base = current_avg * 0.4 + prev_avg * 0.3 + avg5 * 0.3
     else:
         # Look up historical NRL stats for this player
         matched = match_name(sc_player["name"], nrl_names)
@@ -690,10 +814,23 @@ def predict_player_points(sc_player, historical, nrl_names, league_opp_avgs=None
     # Capped to avoid wild swings on small sample sizes.
     opp_factor = 1.0
     if league_opp_avgs:
-        primary_pos = sc_player["positions"][0]
-        opp_ranking = sc_player.get("opp_rankings", {}).get(primary_pos, {})
-        opp_concedes = opp_ranking.get("avg", 0)
-        league_avg = league_opp_avgs.get(primary_pos, 0)
+        opp_rankings = sc_player.get("opp_rankings", {})
+        opp_concedes = 0
+        league_avg = 0
+        for pos in sc_player.get("positions", []):
+            ranking = opp_rankings.get(pos)
+            if ranking and ranking.get("avg", 0) > 0:
+                opp_concedes = ranking["avg"]
+                league_avg = league_opp_avgs.get(pos, 0)
+                if league_avg > 0:
+                    break
+
+        if opp_concedes == 0:
+            for pos, ranking in opp_rankings.items():
+                if ranking.get("avg", 0) > 0 and league_opp_avgs.get(pos, 0) > 0:
+                    opp_concedes = ranking["avg"]
+                    league_avg = league_opp_avgs[pos]
+                    break
 
         if opp_concedes > 0 and league_avg > 0:
             raw_ratio = opp_concedes / league_avg
@@ -710,7 +847,8 @@ def predict_player_points(sc_player, historical, nrl_names, league_opp_avgs=None
 
 # ── Squad Optimization ─────────────────────────────────────────────────────────
 
-STARTING_18 = 18  # 13 + 4 interchange + 1 flex on field; best 17 scores count
+STARTING_18 = 18  # 13 + 4 interchange + 1 flex on field
+SCORING_17 = 17  # best 17 of the 18 nominated players count
 
 
 def optimize_squad(players, strategy="points", current_squad_names=None,
@@ -745,7 +883,8 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
     -----------
     * Each player assigned to at most one position.
     * Each position filled to its required count, +1 flex.
-    * Total squad = 26, exactly 17 starters.
+    * Total squad = 26, exactly 18 nominated starters.
+    * Only 17 of those starters score each round.
     * Starter only if selected: s[i] <= sum_p x[i, p].
     * Total salary <= cap.
     * (Trade mode) position counts locked to current squad's layout.
@@ -753,20 +892,19 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
     N = len(players)
     positions = list(POSITION_REQUIREMENTS.keys())
     P = len(positions)
-    # Variables: [x[i,j] .. , s[i] .. , t[i,j] .. ]
+    # Variables: [x[i,j] .. , s[i] .. , u[i] .. , t[i,j] .. ]
     #   x[i,j]  binary – player i assigned to position j (in the 26)
     #   s[i]    binary – player i is a starter (in the 18)
+    #   u[i]    binary – player i scores as one of the best 17 starters
     #   t[i,j]  binary – player i is a starter AT position j (= x[i,j] * s[i])
     num_x = N * P
     num_s = N
+    num_u = N
     num_t = N * P
-    num_vars = num_x + num_s + num_t
+    num_vars = num_x + num_s + num_u + num_t
 
     # ── Objective ─────────────────────────────────────────────────────────
-    # Only starters contribute to the score (milp minimises → negate).
-    # BYE / non-playing squad members get 0 starter value so the optimizer
-    # always benches them in favour of someone who will actually score.
-    NON_PLAYING_STATUSES = ("Bye", "Injury", "Suspended", "NotPlayingNextRound")
+    # Only the 17 scoring starters contribute to the score (milp minimises → negate).
     c = np.zeros(num_vars)
     for i, pl in enumerate(players):
         if pl.get("status") in NON_PLAYING_STATUSES:
@@ -779,7 +917,7 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
             )
         else:
             score = pl["predicted_points"]
-        c[num_x + i] = -score  # only the s[i] variable carries the objective
+        c[num_x + num_s + i] = -score  # only the u[i] variable carries the objective
 
     # ── Bounds ────────────────────────────────────────────────────────────
     ub = np.zeros(num_vars)
@@ -791,11 +929,14 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
     # s bounds: all players can potentially be starters
     for i in range(N):
         ub[num_x + i] = 1.0
+    # u bounds: all starters can potentially score in the best 17
+    for i in range(N):
+        ub[num_x + num_s + i] = 1.0
     # t bounds: same eligibility as x
     for i, pl in enumerate(players):
         for j, pos in enumerate(positions):
             if pos in pl["positions"]:
-                ub[num_x + num_s + i * P + j] = 1.0
+                ub[num_x + num_s + num_u + i * P + j] = 1.0
 
     bounds = Bounds(lb=0.0, ub=ub)
     integrality = np.ones(num_vars)
@@ -835,11 +976,19 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
         for j in range(P):
             A_starter[i, i * P + j] = -1.0    # -x[i,p]
 
-    # 6. Exactly 18 starters
-    A_scoring = np.zeros((1, num_vars))
-    A_scoring[0, num_x:num_x + num_s] = 1.0
+    # 6. Scoring starter only if player is selected as a starter: u[i] <= s[i]
+    A_scoring_star = np.zeros((N, num_vars))
+    for i in range(N):
+        A_scoring_star[i, num_x + num_s + i] = 1.0
+        A_scoring_star[i, num_x + i] = -1.0
 
-    # 7. Linearise t[i,j] = x[i,j] * s[i]:
+    # 7. Exactly 18 nominated starters and 17 scoring starters
+    A_starters = np.zeros((1, num_vars))
+    A_starters[0, num_x:num_x + num_s] = 1.0
+    A_scoring = np.zeros((1, num_vars))
+    A_scoring[0, num_x + num_s:num_x + num_s + num_u] = 1.0
+
+    # 8. Linearise t[i,j] = x[i,j] * s[i]:
     #    t[i,j] <= x[i,j]
     #    t[i,j] <= s[i]
     #    t[i,j] >= x[i,j] + s[i] - 1
@@ -849,7 +998,7 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
     for i in range(N):
         for j in range(P):
             idx = i * P + j
-            t_idx = num_x + num_s + idx
+            t_idx = num_x + num_s + num_u + idx
             A_t_le_x[idx, t_idx] = 1.0    # t[i,j] <= x[i,j]
             A_t_le_x[idx, idx] = -1.0
             A_t_le_s[idx, t_idx] = 1.0     # t[i,j] <= s[i]
@@ -858,13 +1007,13 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
             A_t_ge[idx, idx] = 1.0         #  → x[i,j] + s[i] - t[i,j] <= 1
             A_t_ge[idx, num_x + i] = 1.0
 
-    # 8. Minimum starters per position: sum_i t[i,j] >= MIN_STARTERS[j]
+    # 9. Minimum starters per position: sum_i t[i,j] >= MIN_STARTERS[j]
     A_min_start = np.zeros((P, num_vars))
     min_start_lb = np.zeros(P)
     for j in range(P):
         pos = positions[j]
         for i in range(N):
-            A_min_start[j, num_x + num_s + i * P + j] = 1.0
+            A_min_start[j, num_x + num_s + num_u + i * P + j] = 1.0
         min_start_lb[j] = MIN_STARTERS.get(pos, 0)
 
     constraints = [
@@ -873,10 +1022,12 @@ def optimize_squad(players, strategy="points", current_squad_names=None,
         LinearConstraint(A_total, SQUAD_SIZE, SQUAD_SIZE),
         LinearConstraint(A_salary, 0, effective_cap),
         LinearConstraint(A_starter, -np.inf, 0),       # s[i] <= selected[i]
-        LinearConstraint(A_scoring, STARTING_18, STARTING_18),
+        LinearConstraint(A_scoring_star, -np.inf, 0),  # u[i] <= s[i]
+        LinearConstraint(A_starters, STARTING_18, STARTING_18),
+        LinearConstraint(A_scoring, SCORING_17, SCORING_17),
         LinearConstraint(A_t_le_x, -np.inf, 0),        # t <= x
         LinearConstraint(A_t_le_s, -np.inf, 0),        # t <= s
-        LinearConstraint(A_t_ge, -np.inf, 1),           # x + s - t <= 1
+        LinearConstraint(A_t_ge, -np.inf, 1),          # x + s - t <= 1
         LinearConstraint(A_min_start, min_start_lb, np.inf),  # min starters/pos
     ]
 
@@ -1004,8 +1155,12 @@ def print_squad(squad, salary_cap=None):
     starters = [p for p in squad if p.get("starter", True)]
     bench = [p for p in squad if not p.get("starter", True)]
     total_price = sum(p["price"] for p in squad)
-    starter_points = sum(p["predicted_points"] for p in starters)
     total_growth = sum(p.get("growth", 0) for p in starters)
+
+    scoring_starters = sorted(starters, key=lambda p: p["predicted_points"], reverse=True)
+    scoring_17 = scoring_starters[:17]
+    scoring_17_points = sum(p["predicted_points"] for p in scoring_17)
+    emergency = scoring_starters[17] if len(scoring_starters) > 17 else None
 
     print(f"\n  {'-' * 120}")
     print(
@@ -1028,7 +1183,13 @@ def print_squad(squad, salary_cap=None):
         flag = _status_flag(p)
         growth = p.get("growth", 0)
         growth_str = f"{growth:+.0f}" if growth != 0 else "0"
-        role = "START" if p.get("starter", True) else "BENCH"
+        if p.get("starter", True):
+            if emergency and p["name"] == emergency["name"]:
+                role = "EMG"
+            else:
+                role = "START"
+        else:
+            role = "BENCH"
         print(
             f"    {p['name']:<25s} {p['team']:<15s} "
             f"{'/'.join(p['positions']):<8s} "
@@ -1043,7 +1204,7 @@ def print_squad(squad, salary_cap=None):
     bench_price = sum(p["price"] for p in bench)
     print(
         f"  {'SCORING 17':<25s} {'':15s} {'':8s} "
-        f"{'':>10s} {starter_points:>7.1f} "
+        f"{'':>10s} {scoring_17_points:>7.1f} "
         f"{'':>5s} {total_growth:>+7.0f}"
     )
     print(
@@ -1102,6 +1263,11 @@ def main():
         "--token", type=str, default=None,
         help="Bearer token for --sync-squad (from browser DevTools).",
     )
+    parser.add_argument(
+        "--set-budget", type=int, default=None,
+        help="Manually set remaining salary budget (e.g. --set-budget 450000). "
+             "Saved to squad file for future runs.",
+    )
     args = parser.parse_args()
 
     if args.sync_squad:
@@ -1109,6 +1275,17 @@ def main():
             sync_squad_with_token(args.token)
         else:
             sync_squad_from_web()
+        return
+
+    if args.set_budget is not None:
+        data = _load_squad_file()
+        if not data:
+            print("  No saved squad found. Run --sync-squad first.")
+            return
+        data["salary_remaining"] = args.set_budget
+        with open(SQUAD_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"  Saved salary_remaining = ${args.set_budget:,} to squad file.")
         return
 
     trade_mode = args.trades
@@ -1159,7 +1336,11 @@ def main():
     if league_opp_avgs:
         print(f"  Opponent adjustments: "
               + ", ".join(f"{pos}={avg:.0f}" for pos, avg in sorted(league_opp_avgs.items())))
+    # Fetch breakeven data from nrlsupercoachstats.com
+    scraped_bes = fetch_breakevens()
+
     print("  Predicting player points (with opponent + home/away adjustments)...")
+    be_from_scrape = 0
     for p in sc_players:
         p["predicted_points"] = predict_player_points(
             p, historical, nrl_names, league_opp_avgs
@@ -1168,15 +1349,26 @@ def main():
             p["predicted_points"] / (p["price"] / 100_000) if p["price"] > 0 else 0
         )
         be = p["breakeven"]
-        if not be:
-            # API doesn't always provide breakeven. Estimate it:
-            # BE ≈ the score needed to maintain current price.
-            # SuperCoach prices move based on rolling 5-round avg vs price-
-            # implied average.  A reasonable proxy is the current average.
-            avg = p.get("avg5") or p.get("current_avg") or p.get("previous_average") or 0
-            be = avg
+        if not be and be != 0:
+            # API didn't provide breakeven — try scraped data
+            scraped_be = scraped_bes.get(p["name"])
+            if scraped_be is not None:
+                be = scraped_be
+                be_from_scrape += 1
+            else:
+                # Last resort: estimate from current average
+                avg = p.get("avg5") or p.get("current_avg") or p.get("previous_average") or 0
+                be = avg
             p["breakeven"] = be
-        p["growth"] = p["predicted_points"] - be if be > 0 else 0
+        elif be == 0 and p["name"] in scraped_bes:
+            # API returned 0 but scraped data has the real BE (could be negative)
+            be = scraped_bes[p["name"]]
+            p["breakeven"] = be
+            be_from_scrape += 1
+        # Growth = how much the player will outscore their BE (drives price rises)
+        p["growth"] = p["predicted_points"] - be
+    if be_from_scrape:
+        print(f"  Updated {be_from_scrape} breakevens from nrlsupercoachstats.com")
 
     # ── 4. Eligibility filter ─────────────────────────────────────────────
     ALWAYS_EXCLUDE = ("Suspended", "Injury")
@@ -1193,9 +1385,9 @@ def main():
                 team_lists = fetch_team_lists(pred_year, pred_round, upcoming)
                 for (home, away), squad in team_lists.items():
                     for p in squad.get("home_players", []):
-                        confirmed_names.add(p["fullName"].strip().lower())
+                        confirmed_names.add(normalize_name(p.get("fullName", "")))
                     for p in squad.get("away_players", []):
-                        confirmed_names.add(p["fullName"].strip().lower())
+                        confirmed_names.add(normalize_name(p.get("fullName", "")))
                 print(f"  {len(confirmed_names)} players confirmed in NRL team lists")
             else:
                 print("  No upcoming matches found, skipping playing-only filter")
@@ -1209,7 +1401,7 @@ def main():
             return False
         if p["status"] in ALWAYS_EXCLUDE:
             return False
-        if playing_only and p["name"].strip().lower() not in confirmed_names:
+        if playing_only and normalize_name(p["name"]) not in confirmed_names:
             return False
         return True
 
@@ -1220,7 +1412,7 @@ def main():
 
     # ── 5. Trade mode or fresh squad ──────────────────────────────────────
     if trade_mode:
-        my_squad, trades_used, trade_history = load_my_squad()
+        my_squad, trades_used, trade_history, saved_salary_remaining = load_my_squad()
         if not my_squad:
             print("  No saved squad found! Run without --trades first to build one.")
             return
@@ -1231,6 +1423,7 @@ def main():
         max_trades = min(max_trades, trades_remaining)
 
         current_names = {p["name"] for p in my_squad}
+        normalized_current_names = {normalize_name(name) for name in current_names}
         print(f"  Loaded saved squad ({len(my_squad)} players)")
         print(
             f"  Round {current_round}: "
@@ -1239,12 +1432,23 @@ def main():
         )
 
         # Compute effective salary cap for trade mode.
-        # Players already owned keep their value regardless of price rises,
-        # so the cap = current squad total at API prices + remaining budget.
-        saved_total = sum(p["price"] for p in my_squad)
-        remaining_budget = SALARY_CAP - saved_total
+        # The saved squad prices are *current market prices* (updated at sync),
+        # NOT the prices we originally purchased at.  SuperCoach tracks your
+        # actual remaining budget separately, so we must use that value from
+        # the API (stored during --sync-squad) rather than deriving it from
+        # SALARY_CAP minus current prices (which gives a wrong negative number
+        # when player prices have risen since the season started).
         sc_lookup = {p["name"]: p["price"] for p in sc_players}
         current_api_total = sum(sc_lookup.get(p["name"], p["price"]) for p in my_squad)
+
+        if saved_salary_remaining is not None:
+            remaining_budget = saved_salary_remaining
+        else:
+            # Fallback: estimate from the salary cap. This may be inaccurate
+            # if prices have risen. Re-sync squad to get the real value.
+            remaining_budget = SALARY_CAP - current_api_total
+            print("  [!] No salary_remaining from API -- re-sync your squad for accuracy")
+
         trade_cap = current_api_total + remaining_budget
         print(f"  Salary budget: ${remaining_budget:,} available for trade upgrades")
 
@@ -1253,14 +1457,16 @@ def main():
         # (they're already on our team and can't be un-rostered).
         trade_in_eligible = [
             p for p in eligible
-            if p["name"] in current_names
-            or (confirmed_names and p["name"].strip().lower() in confirmed_names)
+            if normalize_name(p["name"]) in normalized_current_names
+            or (confirmed_names and normalize_name(p["name"]) in confirmed_names)
             or not confirmed_names
         ]
         pool = list(trade_in_eligible)
+        pool_names = {normalize_name(x["name"]) for x in pool}
         for p in sc_players:
-            if p["name"] in current_names and p["name"] not in {x["name"] for x in pool}:
+            if normalize_name(p["name"]) in normalized_current_names and normalize_name(p["name"]) not in pool_names:
                 pool.append(p)
+                pool_names.add(normalize_name(p["name"]))
 
         playing_in = sum(1 for p in pool if p["name"] not in current_names)
         print(f"  {playing_in} confirmed-playing trade-in candidates")
@@ -1292,20 +1498,135 @@ def main():
         traded_out = current_names - new_names
         traded_in = new_names - current_names
 
+        # ── Filter out low-value trades ───────────────────────────────────
+        # Each trade has an opportunity cost: using one now means it can't
+        # be used later for a bigger upgrade (injury cover, breakout player,
+        # etc.).  Require a minimum points gain that scales with scarcity.
+        #   - Early season (40+ trades left): ~5 pts minimum
+        #   - Mid season  (20-40 left):       ~8 pts minimum
+        #   - Late season (<20 left):         ~12 pts minimum
+        min_trade_gain = 5.0 + 7.0 * (1.0 - trades_remaining / TOTAL_SEASON_TRADES)
+
+        if traded_out:
+            out_players = [p for p in sc_players if p["name"] in traded_out]
+            in_players = [p for p in new_squad if p["name"] in traded_in]
+
+            # Pair trades by position: each out player must match an in
+            # player at the same assigned position (SuperCoach requires
+            # like-for-like trades).  Look up each out player's position
+            # from the saved squad and match to the in player's position
+            # assigned by the optimizer.
+            saved_positions = {
+                p["name"]: p.get("assigned_position", p["positions"][0])
+                for p in my_squad
+            }
+            # Group in-players by their assigned position
+            in_by_pos = defaultdict(list)
+            for p in in_players:
+                in_by_pos[p["assigned_position"]].append(p)
+
+            paired_trades = []
+            unmatched_out = []
+            for o in out_players:
+                out_pos = saved_positions.get(o["name"], o["positions"][0])
+                if out_pos == "FLX":
+                    out_pos = o["positions"][0] if o["positions"] else "2RF"
+                candidates = in_by_pos.get(out_pos, [])
+                if candidates:
+                    # Pick the best candidate at this position
+                    best = max(candidates, key=lambda p: p["predicted_points"])
+                    candidates.remove(best)
+                    paired_trades.append((o, best))
+                else:
+                    unmatched_out.append(o)
+
+            # Filter trades: must be affordable and above the points threshold.
+            # Reduce the threshold for bye/injured/suspended players
+            # since there is immediate upside to trading them out.
+            kept_trades = []
+            rejected_trades = []
+            unaffordable_trades = []
+            budget_left = remaining_budget
+            for o, i in paired_trades:
+                net_cost = i["price"] - o["price"]
+                if net_cost > budget_left:
+                    unaffordable_trades.append((o, i, net_cost))
+                    continue
+                pts_diff = i["predicted_points"] - o["predicted_points"]
+                threshold = (
+                    min_trade_gain * 0.5
+                    if o.get("status") in NON_PLAYING_STATUSES
+                    else min_trade_gain
+                )
+                if pts_diff >= threshold:
+                    kept_trades.append((o, i))
+                    budget_left -= net_cost
+                else:
+                    rejected_trades.append((o, i, pts_diff))
+
+            # Collect all trades to revert (rejected + unaffordable + unmatched)
+            reverts = [(o, i) for o, i, _ in rejected_trades]
+            reverts += [(o, i) for o, i, _ in unaffordable_trades]
+            # Unmatched out players had no same-position trade-in partner;
+            # find the in-player the optimizer paired them with and revert.
+            for o in unmatched_out:
+                # The optimizer removed this player; find who replaced them
+                # by looking for in-players not already paired
+                paired_in_names = {i["name"] for _, i in paired_trades}
+                for ip in in_players:
+                    if ip["name"] not in paired_in_names:
+                        reverts.append((o, ip))
+                        paired_in_names.add(ip["name"])
+                        break
+
+            for o, i in reverts:
+                traded_out.discard(o["name"])
+                traded_in.discard(i["name"])
+                # Swap the trade-in back to the original player in new_squad
+                for idx, p in enumerate(new_squad):
+                    if p["name"] == i["name"]:
+                        orig = next((sp for sp in sc_players if sp["name"] == o["name"]), None)
+                        if orig:
+                            orig_copy = dict(orig)
+                            orig_copy["assigned_position"] = p["assigned_position"]
+                            orig_copy["starter"] = p["starter"]
+                            new_squad[idx] = orig_copy
+                        break
+
+            if unmatched_out:
+                print(f"\n  CROSS-POSITION TRADES (not allowed, skipped):")
+                for o in unmatched_out:
+                    out_pos = saved_positions.get(o["name"], o["positions"][0])
+                    print(
+                        f"    {o['name']:<25s} ({out_pos}) - no same-position upgrade found"
+                    )
+
+            if unaffordable_trades:
+                print(f"\n  UNAFFORDABLE TRADES (${remaining_budget:,} budget, skipped):")
+                for o, i, cost in unaffordable_trades:
+                    print(
+                        f"    {o['name']:<25s} -> {i['name']:<25s}  "
+                        f"cost: ${cost:,} (over budget by ${cost - remaining_budget:,})"
+                    )
+
+            if rejected_trades:
+                print(f"\n  TRADES BELOW THRESHOLD (min {min_trade_gain:.0f}pts gain, skipped):")
+                for o, i, diff in rejected_trades:
+                    print(
+                        f"    {o['name']:<25s} -> {i['name']:<25s}  "
+                        f"gain: {diff:+.1f}pts (not worth a trade)"
+                    )
+
         if not traded_out:
             print("\n  NO TRADES RECOMMENDED - current squad is optimal.")
         else:
             print(f"\n  RECOMMENDED TRADES ({len(traded_out)}):")
-            out_players = [p for p in sc_players if p["name"] in traded_out]
-            in_players = [p for p in new_squad if p["name"] in traded_in]
-            for o, i in zip(
-                sorted(out_players, key=lambda x: x["predicted_points"]),
-                sorted(in_players, key=lambda x: x["predicted_points"], reverse=True),
-            ):
+            for o, i in kept_trades:
                 pts_diff = i["predicted_points"] - o["predicted_points"]
+                status_tag = f" [{o['status']}]" if o.get("status") in NON_PLAYING_STATUSES else ""
                 print(
                     f"    OUT: {o['name']:<25s} ({o['team']:<15s} "
-                    f"${o['price']:>9,d}  {o['predicted_points']:>5.1f}pts)"
+                    f"${o['price']:>9,d}  {o['predicted_points']:>5.1f}pts){status_tag}"
                 )
                 print(
                     f"    IN:  {i['name']:<25s} ({i['team']:<15s} "
@@ -1356,10 +1677,7 @@ def main():
                 save_squad(new_squad)
                 trade_list = [
                     {"out": o, "in": i, "pts_gain": i["predicted_points"] - o["predicted_points"]}
-                    for o, i in zip(
-                        sorted(out_players, key=lambda x: x["predicted_points"]),
-                        sorted(in_players, key=lambda x: x["predicted_points"], reverse=True),
-                    )
+                    for o, i in kept_trades
                 ]
                 record_trades(trade_list, current_round)
                 print(
